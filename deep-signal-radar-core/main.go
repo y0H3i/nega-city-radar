@@ -43,8 +43,13 @@ const (
 	envPostgresUser           = "POSTGRES_USER"
 	envPostgresPassword       = "POSTGRES_PASSWORD"
 	envPostgresDB             = "POSTGRES_DB"
-	maxErrorDetailLength      = 2048
-	maxLogDetailLength        = 512
+	maxErrorDetailLength = 2048
+	maxLogDetailLength   = 512
+)
+
+const (
+	defaultPythonSynthesizerPath = "synthesizer.py"
+	envGeminiAPIKey              = "GOOGLE_API_KEY" // Used by the Python synthesizer script
 )
 
 const upsertSignalSQL = `
@@ -65,13 +70,36 @@ ORDER BY created_at DESC
 LIMIT 50;
 `
 
+const createReportsTableSQL = `
+CREATE TABLE IF NOT EXISTS reports (
+    id SERIAL PRIMARY KEY,
+    title TEXT NOT NULL,
+    content TEXT NOT NULL,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+`
+
+const insertReportSQL = `
+INSERT INTO reports (title, content)
+VALUES ($1, $2)
+RETURNING id, created_at;
+`
+
+const selectLatestReportsSQL = `
+SELECT id, title, content, created_at
+FROM reports
+ORDER BY created_at DESC
+LIMIT 10;
+`
+
 type app struct {
-	logger            *slog.Logger
-	db                *pgxpool.Pool
-	projectRoot       string
-	pythonExecutable  string
-	pipelineTimeout   time.Duration
-	ingestionInterval time.Duration
+	logger                *slog.Logger
+	db                    *pgxpool.Pool
+	projectRoot           string
+	pythonExecutable      string
+	pythonSynthesizerPath string
+	pipelineTimeout       time.Duration
+	ingestionInterval     time.Duration
 }
 
 // errorResponse is the JSON envelope for HTTP error responses.
@@ -97,6 +125,14 @@ type ingestResponse struct {
 	Trigger  string         `json:"trigger"`
 	Ingested int            `json:"ingested"`
 	Signals  []signalRecord `json:"signals"`
+}
+
+// reportRecord is the storage shape for generated reports.
+type reportRecord struct {
+	ID        int       `json:"id,omitempty"`
+	Title     string    `json:"title"`
+	Content   string    `json:"content"`
+	CreatedAt time.Time `json:"created_at,omitempty"`
 }
 
 func main() {
@@ -130,6 +166,13 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Resolve synthesizer.py path
+	pythonSynthesizerPath, err := resolvePythonScriptPath(projectRoot, defaultPythonSynthesizerPath)
+	if err != nil {
+		logger.Error("failed to resolve Python synthesizer script path", slog.String("err", err.Error()))
+		os.Exit(1)
+	}
+
 	databaseURL := resolveDatabaseURL()
 	dbPool, err := pgxpool.New(ctx, databaseURL)
 	if err != nil {
@@ -143,18 +186,26 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Create reports table if not exists
+	if _, err := dbPool.Exec(ctx, createReportsTableSQL); err != nil {
+		logger.Error("failed to create reports table", slog.String("err", err.Error()))
+		os.Exit(1)
+	}
+	logger.Info("ensured reports table exists")
+
 	pipelineTimeout := resolvePipelineTimeout(logger)
 	ingestionInterval := resolveIngestionInterval(logger)
 	rawPortEnv := strings.TrimSpace(os.Getenv(envPort))
 	listenAddr := resolveListenAddr(logger, rawPortEnv)
 
 	application := &app{
-		logger:            logger,
-		db:                dbPool,
-		projectRoot:       projectRoot,
-		pythonExecutable:  pythonExec,
-		pipelineTimeout:   pipelineTimeout,
-		ingestionInterval: ingestionInterval,
+		logger:                logger,
+		db:                    dbPool,
+		projectRoot:           projectRoot,
+		pythonExecutable:      pythonExec,
+		pythonSynthesizerPath: pythonSynthesizerPath,
+		pipelineTimeout:       pipelineTimeout,
+		ingestionInterval:     ingestionInterval,
 	}
 
 	go application.startIngestionLoop(ctx)
@@ -162,6 +213,8 @@ func main() {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /api/v1/signals", application.handleSignals)
 	mux.HandleFunc("POST /api/v1/ingest", application.handleIngest)
+	mux.HandleFunc("GET /api/v1/reports", application.handleReports)
+	mux.HandleFunc("POST /api/v1/synthesize", application.handleSynthesize)
 
 	server := &http.Server{
 		Addr:              listenAddr,
@@ -176,6 +229,7 @@ func main() {
 		slog.String("project_root", projectRoot),
 		slog.String("python_executable", pythonExec),
 		slog.String("python_executable_source", pythonSource),
+		slog.String("python_synthesizer_path", pythonSynthesizerPath), // New log field
 		slog.Duration("pipeline_timeout", pipelineTimeout),
 		slog.Duration("ingestion_interval", ingestionInterval),
 	)
@@ -230,6 +284,7 @@ func resolveProjectRoot() (string, error) {
 }
 
 func resolvePythonExecutable(projectRoot string, logger *slog.Logger) (string, string) {
+	// 1. Prioritize local virtual environment
 	venvPython := filepath.Join(projectRoot, ".venv", "bin", "python")
 	if info, err := os.Stat(venvPython); err == nil && !info.IsDir() {
 		if abs, absErr := filepath.Abs(venvPython); absErr == nil {
@@ -240,6 +295,7 @@ func resolvePythonExecutable(projectRoot string, logger *slog.Logger) (string, s
 			)
 			return abs, "local_virtual_environment"
 		}
+		// Fallback if Abs fails but Stat succeeded
 		logger.Info(
 			"resolved Python executable",
 			slog.String("python_executable", venvPython),
@@ -248,30 +304,81 @@ func resolvePythonExecutable(projectRoot string, logger *slog.Logger) (string, s
 		return venvPython, "local_virtual_environment"
 	}
 
+	// 2. Check environment variables with strict path validation
 	if envExec := resolvePythonExecutableFromEnv(); envExec != "" {
-		if resolved, err := normalizePythonExecutablePath(projectRoot, envExec); err == nil {
+		var resolvedPath string
+		var source string
+		var err error
+
+		if strings.ContainsRune(envExec, os.PathSeparator) {
+			// If envExec is a path, ensure it's relative to project root or within it, or a system path
+			candidate := envExec
+			if !filepath.IsAbs(candidate) {
+				candidate = filepath.Join(projectRoot, candidate) // Resolve relative to project root
+			}
+
+			// Only allow paths within the project root or system-wide executables
+			if strings.HasPrefix(candidate, projectRoot) {
+				if info, statErr := os.Stat(candidate); statErr == nil && !info.IsDir() {
+					resolvedPath, err = filepath.Abs(candidate)
+					source = "environment (project_relative_or_absolute)"
+				} else {
+					err = fmt.Errorf("path %q not found or is a directory", candidate)
+				}
+			} else {
+				// If absolute path is outside project root, only allow if it's found in system PATH
+				if lookupPath, lookErr := exec.LookPath(filepath.Base(candidate)); lookErr == nil {
+					resolvedPath, err = filepath.Abs(lookupPath)
+					source = "environment (system_path_lookup)"
+				} else {
+					err = fmt.Errorf("absolute path %q is outside project root and not found in system PATH: %w", candidate, lookErr)
+				}
+			}
+		} else {
+			// If envExec is a bare name, look it up in PATH
+			resolvedPath, err = exec.LookPath(envExec)
+			if err == nil {
+				if abs, absErr := filepath.Abs(resolvedPath); absErr == nil {
+					resolvedPath = abs
+				}
+			}
+			source = "environment (path_lookup)"
+		}
+
+		if err == nil && resolvedPath != "" {
 			logger.Info(
 				"resolved Python executable",
-				slog.String("python_executable", resolved),
-				slog.String("source", "environment"),
+				slog.String("python_executable", resolvedPath),
+				slog.String("source", source),
 			)
-			return resolved, "environment"
+			return resolvedPath, source
 		}
+
 		logger.Warn(
 			"invalid Python executable from environment, falling back to default",
 			slog.String("value", envExec),
 			slog.String("primary_env", envPythonExecutable),
 			slog.String("secondary_env", envPythonExec),
+			slog.String("error", err.Error()),
 		)
 	}
 
-	if resolved, err := normalizePythonExecutablePath(projectRoot, defaultPythonExecutable); err == nil {
+	// 3. Fallback to defaultPythonExecutable via system PATH lookup
+	if resolved, err := exec.LookPath(defaultPythonExecutable); err == nil {
+		if abs, absErr := filepath.Abs(resolved); absErr == nil {
+			logger.Info(
+				"resolved Python executable",
+				slog.String("python_executable", abs),
+				slog.String("source", "default_path_lookup"),
+			)
+			return abs, "default_path_lookup"
+		}
 		logger.Info(
 			"resolved Python executable",
 			slog.String("python_executable", resolved),
-			slog.String("source", "default"),
+			slog.String("source", "default_path_lookup"),
 		)
-		return resolved, "default"
+		return resolved, "default_path_lookup"
 	}
 
 	logger.Warn(
@@ -288,35 +395,17 @@ func resolvePythonExecutableFromEnv() string {
 	return strings.TrimSpace(os.Getenv(envPythonExec))
 }
 
-func normalizePythonExecutablePath(projectRoot, executable string) (string, error) {
-	if executable == "" {
-		return "", fmt.Errorf("python executable is empty")
+// resolvePythonScriptPath checks if a python script exists and returns its absolute path.
+func resolvePythonScriptPath(projectRoot, scriptName string) (string, error) {
+	scriptPath := filepath.Join(projectRoot, scriptName)
+	if info, err := os.Stat(scriptPath); err != nil || info.IsDir() {
+		return "", fmt.Errorf("python script %q not found or is a directory: %w", scriptPath, err)
 	}
-
-	if strings.ContainsRune(executable, os.PathSeparator) {
-		candidate := executable
-		if !filepath.IsAbs(candidate) {
-			candidate = filepath.Join(projectRoot, candidate)
-		}
-		if _, err := os.Stat(candidate); err != nil {
-			return "", fmt.Errorf("stat executable path: %w", err)
-		}
-		abs, err := filepath.Abs(candidate)
-		if err != nil {
-			return "", fmt.Errorf("resolve executable path: %w", err)
-		}
-		return abs, nil
-	}
-
-	resolved, err := exec.LookPath(executable)
+	absPath, err := filepath.Abs(scriptPath)
 	if err != nil {
-		return "", fmt.Errorf("look up executable in PATH: %w", err)
+		return "", fmt.Errorf("failed to resolve absolute path for %q: %w", scriptPath, err)
 	}
-	abs, err := filepath.Abs(resolved)
-	if err != nil {
-		return resolved, nil
-	}
-	return abs, nil
+	return absPath, nil
 }
 
 func resolveDatabaseURL() string {
@@ -533,7 +622,8 @@ func (a *app) ingestSignals(parent context.Context, trigger string) ([]signalRec
 		return []signalRecord{}, nil
 	}
 
-	if err := a.upsertSignals(parent, signals); err != nil {
+	// Fix for audit point #2: Use the child ctx with timeout for upsertSignals
+	if err := a.upsertSignals(ctx, signals); err != nil {
 		a.logger.Error(
 			"failed to upsert signals",
 			slog.String("trigger", trigger),
@@ -610,12 +700,13 @@ func (a *app) handleSignals(w http.ResponseWriter, r *http.Request) {
 	rows, err := a.db.Query(ctx, selectLatestSignalsSQL)
 	if err != nil {
 		a.logger.Error("failed to query signals", slog.String("err", err.Error()))
+		// Fix for audit point #1: Do not return raw DB error details to client
 		writeJSONError(
 			w,
 			http.StatusInternalServerError,
 			"database_query_failed",
-			"Failed to fetch signals from database.",
-			truncateString(err.Error(), maxErrorDetailLength),
+			"Failed to fetch signals from database. Please try again later.",
+			"", // Generic error detail for client
 		)
 		return
 	}
@@ -634,12 +725,13 @@ func (a *app) handleSignals(w http.ResponseWriter, r *http.Request) {
 			&row.CreatedAt,
 		); err != nil {
 			a.logger.Error("failed to scan signal row", slog.String("err", err.Error()))
+			// Fix for audit point #1: Do not return raw DB error details to client
 			writeJSONError(
 				w,
 				http.StatusInternalServerError,
 				"database_scan_failed",
-				"Failed to parse signals from database.",
-				truncateString(err.Error(), maxErrorDetailLength),
+				"Failed to parse signals from database. Please try again later.",
+				"", // Generic error detail for client
 			)
 			return
 		}
@@ -648,12 +740,13 @@ func (a *app) handleSignals(w http.ResponseWriter, r *http.Request) {
 
 	if err := rows.Err(); err != nil {
 		a.logger.Error("database row iteration failed", slog.String("err", err.Error()))
+		// Fix for audit point #1: Do not return raw DB error details to client
 		writeJSONError(
 			w,
 			http.StatusInternalServerError,
 			"database_iteration_failed",
-			"Failed while reading signals from database.",
-			truncateString(err.Error(), maxErrorDetailLength),
+			"Failed while reading signals from database. Please try again later.",
+			"", // Generic error detail for client
 		)
 		return
 	}
@@ -761,4 +854,272 @@ func truncateString(s string, max int) string {
 		return s
 	}
 	return s[:max] + "…"
+}
+
+// fetchLatestSignals retrieves the latest signals from the database.
+func (a *app) fetchLatestSignals(ctx context.Context) ([]signalRecord, error) {
+	rows, err := a.db.Query(ctx, selectLatestSignalsSQL)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query latest signals: %w", err)
+	}
+	defer rows.Close()
+
+	results := make([]signalRecord, 0, 50)
+	for rows.Next() {
+		var row signalRecord
+		if err := rows.Scan(
+			&row.ID,
+			&row.Title,
+			&row.URL,
+			&row.SignalScore,
+			&row.Reason,
+			&row.Summary,
+			&row.CreatedAt,
+		); err != nil {
+			return nil, fmt.Errorf("failed to scan signal row: %w", err)
+		}
+		results = append(results, row)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("database row iteration failed: %w", err)
+	}
+	return results, nil
+}
+
+// runPythonSynthesizer executes the Python synthesizer script.
+func runPythonSynthesizer(
+	ctx context.Context,
+	projectRoot string,
+	pythonExecutable string,
+	synthesizerScriptPath string,
+	inputJSON []byte,
+) (stdout string, stderr string, err error) {
+	cmd := exec.CommandContext(ctx, pythonExecutable, synthesizerScriptPath)
+	cmd.Dir = projectRoot
+
+	cmd.Stdin = bytes.NewReader(inputJSON)
+	var stdoutBuf, stderrBuf bytes.Buffer
+	cmd.Stdout = &stdoutBuf
+	cmd.Stderr = &stderrBuf
+
+	runErr := cmd.Run()
+	return stdoutBuf.String(), stderrBuf.String(), runErr
+}
+
+// generateSynthesisReport fetches latest signals, runs the synthesizer script, and stores the report.
+func (a *app) generateSynthesisReport(parent context.Context, trigger string) (reportRecord, error) {
+	ctx, cancel := context.WithTimeout(parent, a.pipelineTimeout) // Re-using pipelineTimeout for synthesis
+	defer cancel()
+
+	// 1. Fetch the latest 50 signals
+	signals, err := a.fetchLatestSignals(ctx)
+	if err != nil {
+		a.logger.Error(
+			"failed to fetch signals for synthesis",
+			slog.String("trigger", trigger),
+			slog.String("err", err.Error()),
+		)
+		return reportRecord{}, fmt.Errorf("failed to fetch signals: %w", err)
+	}
+
+	if len(signals) == 0 {
+		a.logger.Info("no signals available for synthesis", slog.String("trigger", trigger))
+		return reportRecord{}, fmt.Errorf("no signals to synthesize")
+	}
+
+	signalsJSON, err := json.Marshal(signals)
+	if err != nil {
+		a.logger.Error(
+			"failed to marshal signals to JSON",
+			slog.String("trigger", trigger),
+			slog.String("err", err.Error()),
+		)
+		return reportRecord{}, fmt.Errorf("failed to marshal signals: %w", err)
+	}
+
+	// 2. Run the Python synthesizer script
+	stdout, stderr, runErr := runPythonSynthesizer(
+		ctx,
+		a.projectRoot,
+		a.pythonExecutable,
+		a.pythonSynthesizerPath,
+		signalsJSON,
+	)
+	if ctx.Err() == context.DeadlineExceeded {
+		a.logger.Error(
+			"python_synthesizer_timeout",
+			slog.String("trigger", trigger),
+			slog.Duration("timeout", a.pipelineTimeout),
+			slog.String("stderr_tail", truncateString(stderr, maxLogDetailLength)),
+		)
+		return reportRecord{}, ctx.Err()
+	}
+
+	if runErr != nil {
+		a.logger.Error(
+			"python_synthesizer_failed",
+			slog.String("trigger", trigger),
+			slog.String("err", runErr.Error()),
+			slog.String("stderr_tail", truncateString(stderr, maxLogDetailLength)),
+		)
+		return reportRecord{}, fmt.Errorf("synthesizer script failed: %w", runErr)
+	}
+
+	// 3. Parse the output
+	var report reportRecord
+	out := bytes.TrimSpace([]byte(stdout))
+	if len(out) == 0 {
+		return reportRecord{}, fmt.Errorf("synthesizer output is empty")
+	}
+	if !json.Valid(out) {
+		a.logger.Error(
+			"python_synthesizer_invalid_output",
+			slog.String("trigger", trigger),
+			slog.String("stdout_tail", truncateString(stdout, maxLogDetailLength)),
+		)
+		return reportRecord{}, fmt.Errorf("synthesizer output is not valid JSON")
+	}
+
+	if err := json.Unmarshal(out, &report); err != nil {
+		a.logger.Error(
+			"python_synthesizer_unmarshal_failed",
+			slog.String("trigger", trigger),
+			slog.String("err", err.Error()),
+			slog.String("stdout_tail", truncateString(stdout, maxLogDetailLength)),
+		)
+		return reportRecord{}, fmt.Errorf("failed to unmarshal synthesizer output: %w", err)
+	}
+
+	if report.Title == "" || report.Content == "" {
+		a.logger.Error(
+			"python_synthesizer_missing_fields",
+			slog.String("trigger", trigger),
+			slog.String("stdout_tail", truncateString(stdout, maxLogDetailLength)),
+		)
+		return reportRecord{}, fmt.Errorf("synthesizer output missing title or content")
+	}
+
+	// 4. Insert into reports table
+	var insertedID int
+	var insertedCreatedAt time.Time
+	err = a.db.QueryRow(ctx, insertReportSQL, report.Title, report.Content).Scan(&insertedID, &insertedCreatedAt)
+	if err != nil {
+		a.logger.Error(
+			"failed to insert synthesis report",
+			slog.String("trigger", trigger),
+			slog.String("err", err.Error()),
+			slog.String("report_title", report.Title),
+		)
+		return reportRecord{}, fmt.Errorf("failed to save report to database: %w", err)
+	}
+
+	report.ID = insertedID
+	report.CreatedAt = insertedCreatedAt
+
+	a.logger.Info(
+		"generated and saved synthesis report",
+		slog.String("trigger", trigger),
+		slog.Int("report_id", report.ID),
+		slog.String("report_title", report.Title),
+	)
+
+	return report, nil
+}
+
+// handleReports serves the latest synthesis reports.
+func (a *app) handleReports(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+	defer cancel()
+
+	rows, err := a.db.Query(ctx, selectLatestReportsSQL)
+	if err != nil {
+		a.logger.Error("failed to query reports", slog.String("err", err.Error()))
+		writeJSONError(
+			w,
+			http.StatusInternalServerError,
+			"database_query_failed",
+			"Failed to fetch reports from database. Please try again later.",
+			"", // Generic error detail for client
+		)
+		return
+	}
+	defer rows.Close()
+
+	results := make([]reportRecord, 0, 10)
+	for rows.Next() {
+		var row reportRecord
+		if err := rows.Scan(
+			&row.ID,
+			&row.Title,
+			&row.Content,
+			&row.CreatedAt,
+		); err != nil {
+			a.logger.Error("failed to scan report row", slog.String("err", err.Error()))
+			writeJSONError(
+				w,
+				http.StatusInternalServerError,
+				"database_scan_failed",
+				"Failed to parse reports from database. Please try again later.",
+				"", // Generic error detail for client
+			)
+			return
+		}
+		results = append(results, row)
+	}
+
+	if err := rows.Err(); err != nil {
+		a.logger.Error("database row iteration failed", slog.String("err", err.Error()))
+		writeJSONError(
+			w,
+			http.StatusInternalServerError,
+			"database_iteration_failed",
+			"Failed while reading reports from database. Please try again later.",
+			"", // Generic error detail for client
+		)
+		return
+	}
+
+	writeJSON(w, http.StatusOK, results)
+}
+
+// handleSynthesize triggers a manual synthesis report generation.
+func (a *app) handleSynthesize(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	trigger := "manual_api"
+	start := time.Now()
+
+	a.logger.Info(
+		"manual synthesis requested",
+		slog.String("trigger", trigger),
+		slog.String("remote_addr", r.RemoteAddr),
+	)
+
+	report, err := a.generateSynthesisReport(ctx, trigger)
+	if err != nil {
+		a.logger.Error(
+			"manual synthesis failed",
+			slog.String("trigger", trigger),
+			slog.String("err", err.Error()),
+			slog.Duration("duration", time.Since(start)),
+		)
+		writeJSONError(
+			w,
+			http.StatusInternalServerError,
+			"synthesis_failed",
+			"Manual synthesis failed. Check server logs for details.",
+			"", // Generic error detail for client
+		)
+		return
+	}
+
+	a.logger.Info(
+		"manual synthesis completed",
+		slog.String("trigger", trigger),
+		slog.Int("report_id", report.ID),
+		slog.String("report_title", report.Title),
+		slog.Duration("duration", time.Since(start)),
+	)
+
+	writeJSON(w, http.StatusOK, report)
 }
